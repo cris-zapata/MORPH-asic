@@ -29,11 +29,13 @@ always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         pc <= 8'd0;
     end
-    else if (jump_en) begin
-        pc <= jump_address;
-    end
     else if (pc_en) begin
-        pc <= pc + 1'b1;
+        if (jump_en) begin
+            pc <= jump_address;
+        end
+        else begin
+            pc <= pc + 1'b1;
+        end
     end
 end
 endmodule
@@ -120,7 +122,10 @@ module instruction_decoder (
     output logic jump_en,
     output logic [7:0] jump_address,
     output logic reg_write_en,
-    output logic writeback_sel
+    output logic [1:0] writeback_sel,
+    output logic gpio_we,
+    output logic gpio_sel,
+    output logic wait_en
 );
 logic [3:0] opcode; //cpu instruction
 logic [11:0] operand; // remaining space for regs and unused bits
@@ -130,14 +135,17 @@ always_comb begin
     jump_en = 1'b0;
     jump_address = 8'd0;
     reg_write_en = 1'b0;
-    writeback_sel = 1'b0;
+    writeback_sel = 2'b00;
+    wait_en = 1'b0;
+    gpio_we = 1'b0;
+    gpio_sel = 1'b0;
     case (opcode)
     4'b0001: begin
         reg_write_en = 1'b1;
         end
     4'b0010: begin
         reg_write_en = 1'b1;
-        writeback_sel = 1'b1;
+        writeback_sel = 2'b01;
         end
     4'b0011: begin
         jump_en = 1'b1;
@@ -154,6 +162,21 @@ always_comb begin
             jump_en = 1'b1;
             jump_address = operand[7:0];
             end
+        end
+    4'b0110: begin
+        gpio_we = 1'b1;
+        gpio_sel = 1'b1;
+    end
+    4'b0111: begin
+        gpio_we = 1'b1;
+        gpio_sel = 1'b0;
+    end
+    4'b1000: begin
+        reg_write_en = 1'b1;
+        writeback_sel = 2'b10;
+    end
+    4'b1001: begin
+        wait_en = 1'b1;
     end
     default: begin
     end
@@ -465,7 +488,11 @@ module cpu_core (
     input logic [7:0] prog_addr,
     input logic [15:0] prog_data,
     input logic prog_mode,
-    output logic [7:0] debug_pc
+    input logic [7:0] gpio_rdata,
+    output logic [7:0] debug_pc,
+    output logic [7:0] gpio_wdata,
+    output logic gpio_we,
+    output logic gpio_sel
 );
 logic [7:0] alu_result;
 logic [15:0] instruction;
@@ -474,7 +501,7 @@ logic [7:0] reg_data_a; //8-bit bus for a
 logic [7:0] reg_data_b; //8_bit bus for b
 logic [1:0] reg_write_address; //which reg recieves given result
 logic reg_write_en;
-logic writeback_sel;
+logic [1:0] writeback_sel;
 logic [2:0] alu_op; //alu op for cpu mod
 logic alu_carry; //alu carry for cpu mod
 logic alu_zero; // alu zero for cpu mod
@@ -484,12 +511,50 @@ logic jump_en; // tells pc to jmp
 logic pc_en; // pc incrementation
 logic z_flag; // zero flag
 logic flag_write_en; // if on cpu updates, if off no update
+logic gpio_write_decoded;
+logic wait_done;
+logic wait_en;
+logic [7:0] wait_counter;
+logic wait_active;
+assign wait_done = wait_active && (wait_counter == 8'd1);
+assign gpio_wdata = reg_data_a;
+assign gpio_we = gpio_write_decoded && !prog_mode;
 assign debug_pc = pc;
-assign reg_write_data = writeback_sel ? instruction[7:0] : alu_result;
 assign reg_write_address = instruction[11:10];
 assign alu_op = instruction[7:5];
-assign pc_en = !prog_mode;
+assign pc_en = !prog_mode && (
+    !wait_en || (wait_en && !wait_active && reg_data_a <= 8'd1) || wait_done
+);
 assign flag_write_en = (instruction[15:12] == 4'b0001) && !prog_mode;
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        wait_counter <= 8'd0;
+        wait_active  <= 1'b0;
+    end
+    else if (!prog_mode) begin
+        if (wait_active) begin
+            if (wait_counter > 8'd1) begin
+                wait_counter <= wait_counter - 1'b1;
+            end
+            else begin
+                wait_counter <= 8'd0;
+                wait_active  <= 1'b0;
+            end
+        end
+        else if (wait_en && reg_data_a > 8'd1) begin
+            wait_counter <= reg_data_a - 1'b1;
+            wait_active  <= 1'b1;
+        end
+    end
+end
+always_comb begin
+    case (writeback_sel)
+    2'b00: reg_write_data = alu_result;
+    2'b01: reg_write_data = instruction[7:0];
+    2'b10: reg_write_data = gpio_rdata;
+    default: reg_write_data = 8'b0;
+    endcase
+end
 always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         z_flag <= 1'b0;
@@ -540,16 +605,27 @@ instruction_decoder u_instruction_decoder (
     .jump_en(jump_en),
     .jump_address(jump_address),
     .reg_write_en(reg_write_en),
-    .writeback_sel(writeback_sel)
+    .writeback_sel(writeback_sel),
+    .gpio_we(gpio_write_decoded),
+    .gpio_sel(gpio_sel),
+    .wait_en(wait_en)
 );
 endmodule
+//top module
 module morph_top (
     input logic clk,
     input logic rst_n,
     input logic rx,
     input logic prog_mode,
+    input logic [7:0] gpio_in_pins,
+    output logic [7:0] gpio_out_pins,
+    output logic [7:0] gpio_oe,
     output logic [7:0] debug_pc
 );
+logic [7:0] gpio_wdata;
+logic gpio_we;
+logic gpio_sel;
+logic [7:0] gpio_rdata;
 logic [7:0] rx_data;
 logic rx_valid;
 logic [7:0] prog_addr;
@@ -574,10 +650,55 @@ program_loader loader (
 cpu_core cpu (
     .clk(clk),
     .rst_n(rst_n),
-    .prog_we(prog_we),
+    .prog_we(prog_we && prog_mode),
     .prog_addr(prog_addr),
     .prog_data(prog_data),
     .prog_mode(prog_mode),
-    .debug_pc(debug_pc)
+    .debug_pc(debug_pc),
+    .gpio_wdata(gpio_wdata),
+    .gpio_we(gpio_we),
+    .gpio_sel(gpio_sel),
+    .gpio_rdata(gpio_rdata)
 );
+gpio_controller gpio (
+    .clk(clk),
+    .rst_n(rst_n),
+    .gpio_wdata(gpio_wdata),
+    .gpio_we(gpio_we),
+    .gpio_sel(gpio_sel),
+    .gpio_in_pins(gpio_in_pins),
+    .gpio_out_pins(gpio_out_pins),
+    .gpio_oe(gpio_oe),
+    .gpio_rdata(gpio_rdata)
+);
+endmodule
+//GPIO Controller
+module gpio_controller (
+    input logic clk,
+    input logic rst_n,
+    input logic [7:0] gpio_wdata,
+    input logic gpio_we,
+    input logic gpio_sel,
+    input logic [7:0] gpio_in_pins,
+    output logic [7:0] gpio_out_pins,
+    output logic [7:0] gpio_oe,
+    output logic [7:0] gpio_rdata
+);
+logic [7:0] gpio_dir;
+logic [7:0] gpio_out;
+assign gpio_out_pins = gpio_out;
+assign gpio_oe = gpio_dir;
+assign gpio_rdata = gpio_in_pins;
+always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        gpio_out <= 8'b0;
+        gpio_dir <= 8'b0;
+    end
+    else if (gpio_we && !gpio_sel) begin
+        gpio_out <= gpio_wdata;
+    end
+    else if (gpio_we && gpio_sel) begin
+        gpio_dir <= gpio_wdata;
+    end
+end
 endmodule
